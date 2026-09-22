@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""服务入口：uvicorn main:app --reload"""
 
-app = FastAPI()
+from preview_orchestrator.api import app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+__all__ = ["app"]
