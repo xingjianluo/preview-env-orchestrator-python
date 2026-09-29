@@ -112,6 +112,29 @@ class PreviewEnvOrchestrator:
             raise OrchestratorError(ErrorCode.INVALID_PARAMETER, f"{field} must be non-empty")
         return value.strip()
 
+    def _get_by_key_locked(self, request_key: str) -> PreviewEnvironment:
+        """调用方必须持有 store 锁。按 request_key 查环境，查无时报错。
+
+        被接管替换的旧键命中永久墓碑，报 REQUEST_KEY_SUPERSEDED（而非
+        ENV_NOT_FOUND），使老标识的查询结论清楚且一致。
+        """
+        env = self.store.get_by_key(request_key)
+        if env is None:
+            superseded_by = self.store.get_superseded(request_key)
+            if superseded_by is not None:
+                raise OrchestratorError(
+                    ErrorCode.REQUEST_KEY_SUPERSEDED,
+                    f"request_key {request_key!r} was superseded by {superseded_by!r}; "
+                    "use the new identifier",
+                    request_key=request_key,
+                )
+            raise OrchestratorError(
+                ErrorCode.ENV_NOT_FOUND,
+                f"no environment for request_key {request_key!r}",
+                request_key=request_key,
+            )
+        return env
+
     def _reclaim_locked(self, env: PreviewEnvironment, reason: str) -> bool:
         """调用方必须持有 store 锁。返回是否真正释放了资源（重复回收返回 False）。"""
         if env.status == EnvStatus.RECLAIMED:
@@ -122,10 +145,30 @@ class PreviewEnvOrchestrator:
             env.resource_identifiers.clear()
             released = True
         self._release_slot_locked(env)
+        self.store.clear_live(env)
         env.expires_at = None
         self._transition_locked(env, EnvStatus.RECLAIMED, reason)
         action_log(self.log, "reclaim", env.request_key, env.env_id, reason=reason)
         return released
+
+    def _reap_expired_locked(self, current: float) -> list[str]:
+        """调用方必须持有 store 锁。回收所有已到期环境，返回被回收的 env_id。
+
+        这是“到期即时生效”的核心：每个公开操作进入临界区时都会先调用它，
+        因此任何已过期的环境在被查询/续期/接管判断之前就被确定性回收，
+        其槽位与资源立即让出，不依赖人工触发清理。
+        """
+        reclaimed: list[str] = []
+        candidates = [
+            e for e in self.store.all_envs()
+            if e.status == EnvStatus.READY
+            and e.expires_at is not None
+            and current >= e.expires_at
+        ]
+        for env in candidates:
+            if self._reclaim_locked(env, f"ttl expired at {env.expires_at:g}"):
+                reclaimed.append(env.env_id)
+        return reclaimed
 
     # -------------------------------------------------------------- provision
 
@@ -142,6 +185,8 @@ class PreviewEnvOrchestrator:
             raise
 
         with self.store.lock():
+            # 到期即时生效：先做惰性回收，过期环境立即释放容量、不可再被复用/接管
+            self._reap_expired_locked(self.now())
             # 同键并发：要么复用已存在环境，要么等创建者完成后复用其结果
             while True:
                 existing = self.store.get_by_key(request_key)
@@ -160,11 +205,26 @@ class PreviewEnvOrchestrator:
                             request_key=request_key,
                         )
                     existing.reused = True
+                    existing.taken_over = False
                     action_log(
                         self.log, "provision-reuse", request_key, existing.env_id,
                         status=existing.status.value,
                     )
                     return existing
+                if existing is None:
+                    # 该键曾被接管替换：永久墓碑，拒绝复用以防止新旧标识来回翻转
+                    superseded_by = self.store.get_superseded(request_key)
+                    if superseded_by is not None:
+                        reject_log(
+                            self.log, request_key, ErrorCode.REQUEST_KEY_SUPERSEDED,
+                            f"superseded by {superseded_by}",
+                        )
+                        raise OrchestratorError(
+                            ErrorCode.REQUEST_KEY_SUPERSEDED,
+                            f"request_key {request_key!r} was superseded by "
+                            f"{superseded_by!r} and is permanently retired",
+                            request_key=request_key,
+                        )
                 if self.store.begin_creation(request_key):
                     break
                 action_log(self.log, "provision-await", request_key)
@@ -173,6 +233,27 @@ class PreviewEnvOrchestrator:
 
             # 本线程获得创建权
             try:
+                # 同项目分支已有存活环境：新标识接管同一份环境，绝不并存第二份。
+                # 接管不新增槽位（环境已持有；failed 环境本就不占槽）；
+                # 过期环境已在进入临界区时被惰性回收，不会在这里被“救活”。
+                live = self.store.get_live(project, branch)
+                if live is not None:
+                    old_key = self.store.rebind_key(live, request_key)
+                    live.ttl_seconds = ttl
+                    if live.status == EnvStatus.READY:
+                        # 存活时间从接管（新的就绪）时刻重新起算
+                        live.expires_at = self.now() + ttl
+                    live.taken_over = True
+                    live.reused = False
+                    live.history.append(
+                        f"{self.now():.3f} takeover: {old_key} -> {request_key}"
+                    )
+                    self.store.finish_creation(request_key)
+                    action_log(
+                        self.log, "takeover", request_key, live.env_id,
+                        old_key=old_key, status=live.status.value,
+                    )
+                    return live
                 if self.store.available_slots() <= 0:
                     reject_log(
                         self.log, request_key, ErrorCode.QUOTA_EXHAUSTED,
@@ -208,6 +289,7 @@ class PreviewEnvOrchestrator:
                     )
                 # 先登记再调用后端：等待者能观察到 provisioning 并最终复用同一对象
                 self.store.put(env)
+                self.store.set_live(env)
             except BaseException:
                 self.store.finish_creation(request_key)
                 raise
@@ -259,7 +341,7 @@ class PreviewEnvOrchestrator:
                 )
             env.resource_identifiers = resources
             env.ready_at = self.now()
-            env.expires_at = env.ready_at + ttl
+            env.expires_at = env.ready_at + env.ttl_seconds
             self._transition_locked(env, EnvStatus.READY, "allocated")
             self.store.finish_creation(request_key)
             return env
@@ -270,15 +352,10 @@ class PreviewEnvOrchestrator:
         request_key = self._validate_identity(request_key, "request_key")
 
         with self.store.lock():
+            self._reap_expired_locked(self.now())
             # 同键串行化；在循环内统一复查状态，晚到线程复用已完成的重试结果
             while True:
-                env = self.store.get_by_key(request_key)
-                if env is None:
-                    raise OrchestratorError(
-                        ErrorCode.ENV_NOT_FOUND,
-                        f"no environment for request_key {request_key!r}",
-                        request_key=request_key,
-                    )
+                env = self._get_by_key_locked(request_key)
                 if env.status == EnvStatus.RECLAIMED:
                     raise OrchestratorError(
                         ErrorCode.ENV_RECLAIMED,
@@ -288,6 +365,7 @@ class PreviewEnvOrchestrator:
                 if env.status == EnvStatus.READY:
                     # 其他线程已重试成功：幂等复用
                     env.reused = True
+                    env.taken_over = False
                     action_log(self.log, "retry-reuse", request_key, env.env_id)
                     return env
                 if env.status == EnvStatus.PROVISIONING or not self.store.begin_creation(
@@ -360,13 +438,8 @@ class PreviewEnvOrchestrator:
     def get(self, request_key: str) -> PreviewEnvironment:
         request_key = self._validate_identity(request_key, "request_key")
         with self.store.lock():
-            env = self.store.get_by_key(request_key)
-            if env is None:
-                raise OrchestratorError(
-                    ErrorCode.ENV_NOT_FOUND,
-                    f"no environment for request_key {request_key!r}",
-                    request_key=request_key,
-                )
+            self._reap_expired_locked(self.now())
+            env = self._get_by_key_locked(request_key)
             if env.status == EnvStatus.RECLAIMED:
                 raise OrchestratorError(
                     ErrorCode.ENV_RECLAIMED,
@@ -381,13 +454,8 @@ class PreviewEnvOrchestrator:
         request_key = self._validate_identity(request_key, "request_key")
         ttl = self._validate_ttl(ttl_seconds)
         with self.store.lock():
-            env = self.store.get_by_key(request_key)
-            if env is None:
-                raise OrchestratorError(
-                    ErrorCode.ENV_NOT_FOUND,
-                    f"no environment for request_key {request_key!r}",
-                    request_key=request_key,
-                )
+            self._reap_expired_locked(self.now())
+            env = self._get_by_key_locked(request_key)
             if env.status == EnvStatus.RECLAIMED:
                 raise OrchestratorError(
                     ErrorCode.ENV_RECLAIMED,
@@ -418,13 +486,8 @@ class PreviewEnvOrchestrator:
     def reclaim(self, request_key: str) -> tuple[PreviewEnvironment, bool]:
         request_key = self._validate_identity(request_key, "request_key")
         with self.store.lock():
-            env = self.store.get_by_key(request_key)
-            if env is None:
-                raise OrchestratorError(
-                    ErrorCode.ENV_NOT_FOUND,
-                    f"no environment for request_key {request_key!r}",
-                    request_key=request_key,
-                )
+            self._reap_expired_locked(self.now())
+            env = self._get_by_key_locked(request_key)
             released = self._reclaim_locked(env, "explicit reclaim")
             return env, released
 
@@ -433,18 +496,8 @@ class PreviewEnvOrchestrator:
     def reap_expired(self, now: float | None = None) -> list[str]:
         """回收所有已超过存活时间的 READY 环境，返回被回收的 env_id（幂等）。"""
         current = self.now() if now is None else now
-        reclaimed: list[str] = []
         with self.store.lock():
-            candidates = [
-                e for e in self.store.all_envs()
-                if e.status == EnvStatus.READY
-                and e.expires_at is not None
-                and current >= e.expires_at
-            ]
-            for env in candidates:
-                if self._reclaim_locked(env, f"ttl expired at {env.expires_at:g}"):
-                    reclaimed.append(env.env_id)
-        return reclaimed
+            return self._reap_expired_locked(current)
 
     # ------------------------------------------------------------------ stats
 

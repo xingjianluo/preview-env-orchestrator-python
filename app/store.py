@@ -24,6 +24,10 @@ class StateStore:
         self._held_ids: set[str] = set()
         # 正在创建/重试中的 request_key，用于把同键并发串行化
         self._inflight: set[str] = set()
+        # 被接管替换掉的 request_key -> 接管它的新 request_key（永久墓碑）
+        self._superseded: dict[str, str] = {}
+        # (project, branch) -> 当前存活（未回收）环境的 env_id
+        self._live_by_branch: dict[tuple[str, str], str] = {}
 
     def lock(self) -> threading.RLock:
         """对外暴露锁，编排层可用它包住“检查+变更”的复合临界区。"""
@@ -36,6 +40,41 @@ class StateStore:
     def get_by_id(self, env_id: str) -> PreviewEnvironment | None:
         with self._lock:
             return self._envs_by_id.get(env_id)
+
+    def get_superseded(self, request_key: str) -> str | None:
+        """若该 request_key 已被接管替换，返回接管它的新 request_key；否则 None。"""
+        with self._lock:
+            return self._superseded.get(request_key)
+
+    def get_live(self, project: str, branch: str) -> PreviewEnvironment | None:
+        """当前项目分支下存活（未回收）的环境；没有则返回 None。"""
+        with self._lock:
+            env_id = self._live_by_branch.get((project, branch))
+            return self._envs_by_id.get(env_id) if env_id is not None else None
+
+    def set_live(self, env: PreviewEnvironment) -> None:
+        """登记环境为其项目分支下的当前存活环境（持锁调用）。"""
+        self._live_by_branch[(env.project, env.branch)] = env.env_id
+
+    def clear_live(self, env: PreviewEnvironment) -> None:
+        """摘除存活登记；仅当索引仍指向该环境时生效（持锁调用）。"""
+        key = (env.project, env.branch)
+        if self._live_by_branch.get(key) == env.env_id:
+            del self._live_by_branch[key]
+
+    def rebind_key(self, env: PreviewEnvironment, new_request_key: str) -> str:
+        """把环境从旧 request_key 原子地改绑到新 request_key（持锁调用）。
+
+        旧键留下永久墓碑（指向新键），此后旧键的一切访问都得到
+        一致且确定的“已被接管”结论；环境对象本身与槽位归属不变。
+        返回被替换掉的旧 request_key。
+        """
+        old_key = env.request_key
+        self._envs_by_key.pop(old_key, None)
+        self._superseded[old_key] = new_request_key
+        env.request_key = new_request_key
+        self._envs_by_key[new_request_key] = env
+        return old_key
 
     def put(self, env: PreviewEnvironment) -> None:
         """登记/更新环境；同 request_key 的新环境会覆盖键索引（旧记录仍在按 id 索引中）。"""

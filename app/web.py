@@ -5,6 +5,7 @@
 - IDENTIFIER_CONFLICT      -> 409
 - QUOTA_EXHAUSTED          -> 429
 - ENV_RECLAIMED            -> 410
+- REQUEST_KEY_SUPERSEDED   -> 410
 - ENV_NOT_FOUND            -> 404
 - NOT_READY                -> 409
 - INVALID_STATE_TRANSITION -> 409
@@ -28,6 +29,7 @@ _HTTP_STATUS = {
     ErrorCode.IDENTIFIER_CONFLICT: 409,
     ErrorCode.QUOTA_EXHAUSTED: 429,
     ErrorCode.ENV_RECLAIMED: 410,
+    ErrorCode.REQUEST_KEY_SUPERSEDED: 410,
     ErrorCode.ENV_NOT_FOUND: 404,
     ErrorCode.NOT_READY: 409,
     ErrorCode.INVALID_STATE_TRANSITION: 409,
@@ -85,6 +87,7 @@ def create_app(
             status=env.status.value,
             expires_at=env.expires_at,
             reused=env.reused,
+            taken_over=env.taken_over,
         )
 
     @app.get("/environments/{request_key}", response_model=EnvView)

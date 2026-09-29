@@ -48,6 +48,8 @@ class PreviewEnvironment:
     history: list[str] = field(default_factory=list)
     # 瞬态标记：本次返回是否来自幂等复用（不持久表达领域状态）
     reused: bool = False
+    # 瞬态标记：本次返回是否来自“换标识接管”（不持久表达领域状态）
+    taken_over: bool = False
 
 
 class ProvisionRequest(BaseModel):
@@ -66,6 +68,7 @@ class ProvisionResponse(BaseModel):
     status: str
     expires_at: float | None = None
     reused: bool = False
+    taken_over: bool = False
 
 
 class EnvView(BaseModel):

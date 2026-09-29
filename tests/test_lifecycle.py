@@ -151,8 +151,8 @@ def test_reclaimed_env_can_be_recreated_with_new_identifier(orchestrator):
 
 
 def test_ttl_expiry_reaper(orchestrator, backend, clock):
-    a = orchestrator.provision(_req("a", ttl=10))
-    b = orchestrator.provision(_req("b", ttl=30))
+    a = orchestrator.provision(_req("a", branch="ta", ttl=10))
+    b = orchestrator.provision(_req("b", branch="tb", ttl=30))
 
     clock.advance(10)
     gone = orchestrator.reap_expired()
