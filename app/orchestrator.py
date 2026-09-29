@@ -123,9 +123,44 @@ class PreviewEnvOrchestrator:
             released = True
         self._release_slot_locked(env)
         env.expires_at = None
+        self.store.clear_branch_live(env)
         self._transition_locked(env, EnvStatus.RECLAIMED, reason)
         action_log(self.log, "reclaim", env.request_key, env.env_id, reason=reason)
         return released
+
+    def _sweep_expired_locked(self) -> list[str]:
+        """调用方必须持有 store 锁。立即回收所有已到期的 READY 环境。
+
+        过期即时生效：任何查询/续期/接管/申请进入临界区后都先调用本方法，
+        过期环境立刻变为 reclaimed、释放后端资源与配额槽位、退出分支单活索引，
+        无需等待显式的 reap 扫描。返回本次被回收的 env_id。
+        """
+        current = self.now()
+        reclaimed: list[str] = []
+        for env in self.store.all_envs():
+            if (
+                env.status == EnvStatus.READY
+                and env.expires_at is not None
+                and current >= env.expires_at
+            ):
+                if self._reclaim_locked(env, f"ttl expired at {env.expires_at:g}"):
+                    reclaimed.append(env.env_id)
+        return reclaimed
+
+    def _superseded_error_locked(self, request_key: str) -> OrchestratorError:
+        """老标识在被接管换走后得到的确定性结论（区别于其他拒绝原因）。"""
+        info = self.store.superseded_info(request_key)
+        if info is not None:
+            env_id, owner = info
+            message = (
+                f"request_key {request_key!r} no longer owns environment {env_id}; "
+                f"ownership was taken over by {owner!r}"
+            )
+        else:  # 防御性兜底，正常路径下调用时必有墓碑
+            message = f"request_key {request_key!r} has been superseded by a newer request"
+        return OrchestratorError(
+            ErrorCode.IDENTIFIER_SUPERSEDED, message, request_key=request_key
+        )
 
     # -------------------------------------------------------------- provision
 
@@ -142,16 +177,18 @@ class PreviewEnvOrchestrator:
             raise
 
         with self.store.lock():
-            # 同键并发：要么复用已存在环境，要么等创建者完成后复用其结果
+            # 同键并发 / 标识轮换共用一个决策循环：任何一次醒来都重新做全量检查，
+            # 结论只取决于锁内的当前状态，因此重复/并发提交结论确定可复现。
             while True:
+                # 过期即时生效：先把已到期环境回收、让出容量与分支单活索引
+                self._sweep_expired_locked()
+
+                # 该标识曾被接管换走 => 永久不再是属主，结论始终一致
+                if self.store.is_superseded(request_key):
+                    raise self._superseded_error_locked(request_key)
+
                 existing = self.store.get_by_key(request_key)
-                # 仅当环境存在、未回收、且没有同键创建仍在进行时才可复用；
-                # 否则可能读到 provisioning 中间态（含条件变量虚假唤醒）。
-                if (
-                    existing is not None
-                    and existing.status != EnvStatus.RECLAIMED
-                    and not self.store.is_inflight(request_key)
-                ):
+                if existing is not None:
                     if (existing.project, existing.branch) != (project, branch):
                         raise OrchestratorError(
                             ErrorCode.IDENTIFIER_CONFLICT,
@@ -159,59 +196,101 @@ class PreviewEnvOrchestrator:
                             f"{existing.project}/{existing.branch}",
                             request_key=request_key,
                         )
-                    existing.reused = True
-                    action_log(
-                        self.log, "provision-reuse", request_key, existing.env_id,
-                        status=existing.status.value,
-                    )
-                    return existing
-                if self.store.begin_creation(request_key):
-                    break
-                action_log(self.log, "provision-await", request_key)
-                self.store.wait_for_creation(request_key)
-                # 被唤醒（含虚假唤醒）后重新检查，直到创建结束并出现终态
+                    if existing.status == EnvStatus.RECLAIMED:
+                        pass  # 同键回收后重建：落到下方创建流程
+                    elif existing.status == EnvStatus.PROVISIONING or self.store.is_inflight(
+                        request_key
+                    ):
+                        # 同键创建仍在进行（含虚假唤醒）：等环境 settle 后重新检查
+                        action_log(self.log, "provision-await", request_key)
+                        self.store.wait_until_settled(existing)
+                        continue
+                    else:
+                        # ready / failed：幂等复用同一对象
+                        existing.reused = True
+                        action_log(
+                            self.log, "provision-reuse", request_key, existing.env_id,
+                            status=existing.status.value,
+                        )
+                        return existing
 
-            # 本线程获得创建权
-            try:
-                if self.store.available_slots() <= 0:
-                    reject_log(
-                        self.log, request_key, ErrorCode.QUOTA_EXHAUSTED,
-                        f"quota={self.store.quota} used={self.store.used_slots()}",
+                # 分支单活：同 project+branch 已有存活环境 => 新标识接管同一份环境，
+                # 绝不并存第二份。过期环境已在上面清扫掉，因此不会“救活”过期环境。
+                live = self.store.live_for_branch(project, branch)
+                if live is not None:
+                    self.store.rebind_key(live, request_key)
+                    action_log(
+                        self.log, "takeover", request_key, live.env_id,
+                        status=live.status.value,
                     )
-                    raise OrchestratorError(
-                        ErrorCode.QUOTA_EXHAUSTED,
-                        f"quota exhausted: used {self.store.used_slots()} of {self.store.quota}",
+                    live.history.append(
+                        f"{self.now():.3f} ownership taken over by key={request_key}"
+                    )
+                    if live.status == EnvStatus.PROVISIONING:
+                        # 接管发生在别人的创建过程中：等就绪/失败结论，再以属主身份复用
+                        self.store.wait_until_settled(live)
+                        continue
+                    if live.status == EnvStatus.READY:
+                        # 租约从接管时刻重新起算（使用本次申请的 TTL）
+                        live.ttl_seconds = ttl
+                        live.ready_at = self.now()
+                        live.expires_at = live.ready_at + ttl
+                        live.history.append(
+                            f"{self.now():.3f} lease restarted on takeover ttl={ttl:g}"
+                        )
+                        action_log(
+                            self.log, "takeover-lease-restart", request_key, live.env_id,
+                            expires_at=live.expires_at,
+                        )
+                    live.reused = True
+                    return live
+
+                # 本线程获得创建权（全新申请或同键回收后重建）
+                if not self.store.begin_creation(request_key):
+                    self.store.wait_for_creation(request_key)
+                    continue
+                try:
+                    if self.store.available_slots() <= 0:
+                        used, total = self.store.used_slots(), self.store.quota
+                        reject_log(
+                            self.log, request_key, ErrorCode.QUOTA_EXHAUSTED,
+                            f"quota={total} used={used}",
+                        )
+                        raise OrchestratorError(
+                            ErrorCode.QUOTA_EXHAUSTED,
+                            f"quota exhausted: used {used} of {total}",
+                            request_key=request_key,
+                        )
+                    env_id = self._new_env_id_locked(project, branch)
+                    env = PreviewEnvironment(
+                        env_id=env_id,
+                        project=project,
+                        branch=branch,
                         request_key=request_key,
+                        status=EnvStatus.PROVISIONING,
+                        created_at=self.now(),
+                        ttl_seconds=ttl,
+                        slot_held=True,
                     )
-                env_id = self._new_env_id_locked(project, branch)
-                env = PreviewEnvironment(
-                    env_id=env_id,
-                    project=project,
-                    branch=branch,
-                    request_key=request_key,
-                    status=EnvStatus.PROVISIONING,
-                    created_at=self.now(),
-                    ttl_seconds=ttl,
-                    slot_held=True,
-                )
-                env.history.append(f"{env.created_at:.3f} created")
-                if not self.store.acquire_slot(env_id):
-                    env.slot_held = False
-                    reject_log(
-                        self.log, request_key, ErrorCode.QUOTA_EXHAUSTED,
-                        "slot lost to concurrent request", env_id=env_id,
-                    )
-                    raise OrchestratorError(
-                        ErrorCode.QUOTA_EXHAUSTED,
-                        "quota exhausted under concurrent contention",
-                        request_key=request_key,
-                    )
-                # 先登记再调用后端：等待者能观察到 provisioning 并最终复用同一对象
-                self.store.put(env)
-            except BaseException:
-                self.store.finish_creation(request_key)
-                raise
-            action_log(self.log, "provision-create", request_key, env_id, ttl=ttl)
+                    env.history.append(f"{env.created_at:.3f} created")
+                    if not self.store.acquire_slot(env_id):
+                        env.slot_held = False
+                        reject_log(
+                            self.log, request_key, ErrorCode.QUOTA_EXHAUSTED,
+                            "slot lost to concurrent request", env_id=env_id,
+                        )
+                        raise OrchestratorError(
+                            ErrorCode.QUOTA_EXHAUSTED,
+                            "quota exhausted under concurrent contention",
+                            request_key=request_key,
+                        )
+                    # 先登记再调用后端：等待者/接管方能观察到 provisioning 同一对象
+                    self.store.put(env)
+                except BaseException:
+                    self.store.finish_creation(request_key)
+                    raise
+                action_log(self.log, "provision-create", request_key, env_id, ttl=ttl)
+                break
 
         # ---- 锁外：模拟慢资源分配 ----
         try:
@@ -229,15 +308,23 @@ class PreviewEnvOrchestrator:
                     action_log(
                         self.log, "provision-fail-race-reclaimed", request_key, env_id
                     )
+                    # 回收前若归属已被别的标识接管：老标识得到确定性的“已被接管”
+                    if env.request_key != request_key:
+                        raise self._superseded_error_locked(request_key)
                     return env
                 env.failure_reason = exc.reason
                 env.failure_count += 1
                 self._transition_locked(env, EnvStatus.FAILED, f"allocate failed: {exc.reason}")
                 self.store.finish_creation(request_key)
+                owner_changed = env.request_key != request_key
             reject_log(
-                self.log, request_key, ErrorCode.PROVISION_FAILED,
+                self.log, env.request_key, ErrorCode.PROVISION_FAILED,
                 exc.reason, env_id=env_id,
             )
+            if owner_changed:
+                # 创建期间环境被新标识接管：失败结论归接管方所有，
+                # 创建者的老标识此后只能看到“已被接管”
+                raise self._superseded_error_locked(request_key)
             return env
 
         with self.store.lock():
@@ -247,6 +334,8 @@ class PreviewEnvOrchestrator:
                 self._release_slot_locked(env)
                 self.store.finish_creation(request_key)
                 action_log(self.log, "provision-race-reclaimed", request_key, env_id)
+                if env.request_key != request_key:
+                    raise self._superseded_error_locked(request_key)
                 return env
             if env.status is not EnvStatus.PROVISIONING:
                 # 理论上不可达，防御性处理，避免状态自相矛盾
@@ -259,9 +348,14 @@ class PreviewEnvOrchestrator:
                 )
             env.resource_identifiers = resources
             env.ready_at = self.now()
-            env.expires_at = env.ready_at + ttl
+            env.expires_at = env.ready_at + env.ttl_seconds
             self._transition_locked(env, EnvStatus.READY, "allocated")
             self.store.finish_creation(request_key)
+            owner_changed = env.request_key != request_key
+            if owner_changed:
+                # 创建成功提交时归属已在创建期间被接管：READY 环境归接管方，
+                # 老创建者得到“已被接管”，绝不返回一个自己已不拥有的环境
+                raise self._superseded_error_locked(request_key)
             return env
 
     # ------------------------------------------------------------------ retry
@@ -272,6 +366,10 @@ class PreviewEnvOrchestrator:
         with self.store.lock():
             # 同键串行化；在循环内统一复查状态，晚到线程复用已完成的重试结果
             while True:
+                # 重试也先让过期即时生效（READY 过期会被回收，落到下方 reclaimed）
+                self._sweep_expired_locked()
+                if self.store.is_superseded(request_key):
+                    raise self._superseded_error_locked(request_key)
                 env = self.store.get_by_key(request_key)
                 if env is None:
                     raise OrchestratorError(
@@ -293,8 +391,9 @@ class PreviewEnvOrchestrator:
                 if env.status == EnvStatus.PROVISIONING or not self.store.begin_creation(
                     request_key
                 ):
-                    # 创建者正在分配中（或令牌被抢）：等待后重新检查
-                    self.store.wait_for_creation(request_key)
+                    # 创建者正在分配中（或令牌被抢）：按环境状态等待后重新检查
+                    # （重试期间可能有新标识接管，因此观察 env 而非只看 inflight 键）
+                    self.store.wait_until_settled(env)
                     continue
                 # 本线程获得重试权且 env 处于 failed
                 break
@@ -331,15 +430,20 @@ class PreviewEnvOrchestrator:
                         f"{self.now():.3f} retry failed after reclaim: {exc.reason}"
                     )
                     self.store.finish_creation(request_key)
+                    if env.request_key != request_key:
+                        raise self._superseded_error_locked(request_key)
                     return env
                 env.failure_reason = exc.reason
                 env.failure_count += 1
                 self._transition_locked(env, EnvStatus.FAILED, f"retry failed: {exc.reason}")
                 self.store.finish_creation(request_key)
+                owner_changed = env.request_key != request_key
             reject_log(
-                self.log, request_key, ErrorCode.PROVISION_FAILED,
+                self.log, env.request_key, ErrorCode.PROVISION_FAILED,
                 exc.reason, env_id=env.env_id,
             )
+            if owner_changed:
+                raise self._superseded_error_locked(request_key)
             return env
 
         with self.store.lock():
@@ -347,12 +451,16 @@ class PreviewEnvOrchestrator:
                 self.backend.deallocate(resources)
                 self._release_slot_locked(env)
                 self.store.finish_creation(request_key)
+                if env.request_key != request_key:
+                    raise self._superseded_error_locked(request_key)
                 return env
             env.resource_identifiers = resources
             env.ready_at = self.now()
             env.expires_at = env.ready_at + env.ttl_seconds
             self._transition_locked(env, EnvStatus.READY, "retry allocated")
             self.store.finish_creation(request_key)
+            if env.request_key != request_key:
+                raise self._superseded_error_locked(request_key)
             return env
 
     # -------------------------------------------------------------------- get
@@ -360,6 +468,9 @@ class PreviewEnvOrchestrator:
     def get(self, request_key: str) -> PreviewEnvironment:
         request_key = self._validate_identity(request_key, "request_key")
         with self.store.lock():
+            self._sweep_expired_locked()
+            if self.store.is_superseded(request_key):
+                raise self._superseded_error_locked(request_key)
             env = self.store.get_by_key(request_key)
             if env is None:
                 raise OrchestratorError(
@@ -381,6 +492,10 @@ class PreviewEnvOrchestrator:
         request_key = self._validate_identity(request_key, "request_key")
         ttl = self._validate_ttl(ttl_seconds)
         with self.store.lock():
+            # 过期即时生效：续期前先清扫，已到期者当场回收，绝不“续命”
+            self._sweep_expired_locked()
+            if self.store.is_superseded(request_key):
+                raise self._superseded_error_locked(request_key)
             env = self.store.get_by_key(request_key)
             if env is None:
                 raise OrchestratorError(
@@ -400,6 +515,8 @@ class PreviewEnvOrchestrator:
                     f"only ready environments can renew lease, current={env.status.value}",
                     request_key=request_key,
                 )
+            # 兜底：sweep 与这里之间无 await（同一临界区），expires 必为未来；
+            # 保留显式检查以在语义上表达“过期不可续期”。
             if env.expires_at is not None and self.now() >= env.expires_at:
                 self._reclaim_locked(env, "expired before renew")
                 raise OrchestratorError(
@@ -418,6 +535,9 @@ class PreviewEnvOrchestrator:
     def reclaim(self, request_key: str) -> tuple[PreviewEnvironment, bool]:
         request_key = self._validate_identity(request_key, "request_key")
         with self.store.lock():
+            self._sweep_expired_locked()
+            if self.store.is_superseded(request_key):
+                raise self._superseded_error_locked(request_key)
             env = self.store.get_by_key(request_key)
             if env is None:
                 raise OrchestratorError(
@@ -431,15 +551,22 @@ class PreviewEnvOrchestrator:
     # ------------------------------------------------------------ reaper (ttl)
 
     def reap_expired(self, now: float | None = None) -> list[str]:
-        """回收所有已超过存活时间的 READY 环境，返回被回收的 env_id（幂等）。"""
-        current = self.now() if now is None else now
+        """回收所有已超过存活时间的 READY 环境，返回被回收的 env_id（幂等）。
+
+        正常路径下过期环境在任意一次 get/renew/reclaim/provision 进入临界区时
+        就已被惰性即时回收；本接口保留用于显式批量扫描（如后台巡检）。
+        ``now`` 参数仅用于测试注入，不传时使用编排器时钟。
+        """
         reclaimed: list[str] = []
         with self.store.lock():
+            if now is None:
+                # 走统一的惰性清扫（使用编排器时钟）
+                return self._sweep_expired_locked()
             candidates = [
                 e for e in self.store.all_envs()
                 if e.status == EnvStatus.READY
                 and e.expires_at is not None
-                and current >= e.expires_at
+                and now >= e.expires_at
             ]
             for env in candidates:
                 if self._reclaim_locked(env, f"ttl expired at {env.expires_at:g}"):
@@ -450,6 +577,8 @@ class PreviewEnvOrchestrator:
 
     def quota_snapshot(self) -> dict[str, int]:
         with self.store.lock():
+            # 快照同样建立在“过期已即时回收”之上，保证计数不留空洞
+            self._sweep_expired_locked()
             used = self.store.used_slots()
             by_status = Counter(e.status.value for e in self.store.all_envs())
         return {

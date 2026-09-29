@@ -3,6 +3,7 @@
 业务错误 -> HTTP 状态码映射：
 - INVALID_PARAMETER        -> 400
 - IDENTIFIER_CONFLICT      -> 409
+- IDENTIFIER_SUPERSEDED    -> 409
 - QUOTA_EXHAUSTED          -> 429
 - ENV_RECLAIMED            -> 410
 - ENV_NOT_FOUND            -> 404
@@ -26,6 +27,7 @@ from app.orchestrator import PreviewEnvOrchestrator
 _HTTP_STATUS = {
     ErrorCode.INVALID_PARAMETER: 400,
     ErrorCode.IDENTIFIER_CONFLICT: 409,
+    ErrorCode.IDENTIFIER_SUPERSEDED: 409,
     ErrorCode.QUOTA_EXHAUSTED: 429,
     ErrorCode.ENV_RECLAIMED: 410,
     ErrorCode.ENV_NOT_FOUND: 404,

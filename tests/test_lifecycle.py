@@ -151,8 +151,10 @@ def test_reclaimed_env_can_be_recreated_with_new_identifier(orchestrator):
 
 
 def test_ttl_expiry_reaper(orchestrator, backend, clock):
-    a = orchestrator.provision(_req("a", ttl=10))
-    b = orchestrator.provision(_req("b", ttl=30))
+    # 不同分支 -> 两份相互独立的存活环境（同分支换键会接管而非并存）
+    a = orchestrator.provision(_req("a", branch="br-a", ttl=10))
+    b = orchestrator.provision(_req("b", branch="br-b", ttl=30))
+    assert a.env_id == "proj-br-a" and b.env_id == "proj-br-b"
 
     clock.advance(10)
     gone = orchestrator.reap_expired()

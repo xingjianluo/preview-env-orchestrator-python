@@ -121,3 +121,38 @@ def test_quota_endpoint(client):
     data = _body(resp)
     assert data["quota"] == 3 and data["used"] == 1 and data["available"] == 2
     assert data["status_ready"] == 1
+
+
+def test_takeover_via_http_reuses_env_and_old_key_409(client):
+    r1 = client.post("/environments", json={
+        "project": "proj", "branch": "feat", "request_key": "ci-1", "ttl_seconds": 60,
+    })
+    assert r1.status_code == 201
+    env_id = _body(r1)["env_id"]
+
+    # 同分支换标识：接管同一份环境（reused=true），不是新申请
+    r2 = client.post("/environments", json={
+        "project": "proj", "branch": "feat", "request_key": "ci-2",
+    })
+    assert r2.status_code == 201
+    data2 = _body(r2)
+    assert data2["env_id"] == env_id
+    assert data2["reused"] is True
+    assert data2["request_key"] == "ci-2"
+
+    # 新属主可查；老标识得到 409 IDENTIFIER_SUPERSEDED
+    assert client.get("/environments/ci-2").status_code == 200
+    old = client.get("/environments/ci-1")
+    assert old.status_code == 409
+    assert _body(old)["error"]["code"] == "IDENTIFIER_SUPERSEDED"
+
+    # 老标识续期/回收同样是 409 且错误码可区分
+    assert client.post("/environments/ci-1/renew", json={}).status_code == 409
+    assert client.delete("/environments/ci-1").status_code == 409
+    assert _body(client.delete("/environments/ci-1"))["error"]["code"] == (
+        "IDENTIFIER_SUPERSEDED"
+    )
+
+    # 新属主回收后环境 410
+    assert client.delete("/environments/ci-2").status_code == 200
+    assert client.get("/environments/ci-2").status_code == 410
