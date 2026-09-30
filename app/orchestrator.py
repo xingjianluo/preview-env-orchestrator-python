@@ -226,13 +226,24 @@ class PreviewEnvOrchestrator:
                     live.history.append(
                         f"{self.now():.3f} ownership taken over by key={request_key}"
                     )
+                    # 无论被接管环境处于哪种状态，存活时间一律以“本次申请的 TTL”为准：
+                    #   provisioning —— 创建者提交就绪时 expires_at = ready_at + 本次 ttl；
+                    #   failed       —— 新属主重试成功时同样按本次 ttl 起算；
+                    #   ready        —— 立即从接管时刻重新起算（见下方）。
+                    # 不提前写入本次 ttl 会导致就绪/重试成功时沿用旧申请的长 TTL，
+                    # 本次申请的短存活时间形同虚设。
+                    live.ttl_seconds = ttl
+                    live.history.append(
+                        f"{self.now():.3f} takeover ttl requested={ttl:g}"
+                    )
                     if live.status == EnvStatus.PROVISIONING:
-                        # 接管发生在别人的创建过程中：等就绪/失败结论，再以属主身份复用
+                        # 接管发生在别人的创建过程中：等就绪/失败结论，再以属主身份复用。
+                        # 若短 TTL 在就绪提交时即到期，醒来后的第一轮 sweep 会当场回收，
+                        # 随后走“同键回收后重建”，绝不让已到期环境以接管名义存活。
                         self.store.wait_until_settled(live)
                         continue
                     if live.status == EnvStatus.READY:
                         # 租约从接管时刻重新起算（使用本次申请的 TTL）
-                        live.ttl_seconds = ttl
                         live.ready_at = self.now()
                         live.expires_at = live.ready_at + ttl
                         live.history.append(

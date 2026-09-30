@@ -532,3 +532,223 @@ def test_takeover_does_not_consume_quota_when_full(orchestrator, backend):
     assert orchestrator.store.used_slots() == 3
     assert backend.active_count() == 9
     _assert_invariants(orchestrator, backend)
+
+
+# ---------------- 接管时本次申请的 TTL 必须最终生效（bugfix-b） ----------------
+#
+# 修复前：接管 provisioning / failed 环境时不写入本次申请的 ttl_seconds，
+#   就绪提交 / 重试成功都沿用旧申请的长 TTL，本次短存活时间形同虚设。
+# 修复后：接管发生的那一刻即以本次 TTL 为准，租约从“新的就绪时刻”起算；
+#   短 TTL 到点立即回收并让出容量，老标识在所有入口得到一致的 superseded。
+
+
+def _delayed_backend(backend):
+    """把 backend.allocate 换成“进入即置位、等 release 才返回”的版本。"""
+    orig = backend.allocate
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed(env_id):
+        entered.set()
+        release.wait(timeout=2)
+        return orig(env_id)
+
+    backend.allocate = delayed  # type: ignore[method-assign]
+    return orig, entered, release
+
+
+def test_takeover_provisioning_short_ttl_takes_effect_at_ready(backend, clock):
+    """接管创建中的环境：就绪后租约必须按本次申请的短 TTL 起算。"""
+    import time
+
+    from app.orchestrator import PreviewEnvOrchestrator
+
+    o = PreviewEnvOrchestrator(quota=3, backend=backend, clock=clock)
+    orig, entered, release = _delayed_backend(backend)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            # 旧申请要求很长的存活时间
+            f_old = pool.submit(o.provision, _req("ci-1", ttl=1000))
+            entered.wait(timeout=2)
+            # 创建进行中新标识接管，只要求 5 秒存活
+            f_new = pool.submit(o.provision, _req("ci-2", ttl=5))
+
+            deadline = time.time() + 2
+            while time.time() < deadline and o.store.get_by_key("ci-2") is None:
+                time.sleep(0.001)
+            assert o.store.get_by_key("ci-1") is None  # 换绑已发生
+            release.set()
+
+            new_env = f_new.result(timeout=2)
+            old_exc = f_old.exception(timeout=2)
+
+        # 接管方拿到唯一的 READY 环境
+        assert new_env.status is EnvStatus.READY
+        assert new_env.request_key == "ci-2"
+        assert new_env.env_id == "proj-main"
+        # 关键断言：本次申请的短 TTL 生效，而不是旧申请的 1000
+        assert new_env.ttl_seconds == 5
+        assert new_env.ready_at == clock()
+        assert new_env.expires_at == clock() + 5
+        # 老创建者失去归属
+        assert isinstance(old_exc, OrchestratorError)
+        assert old_exc.code == ErrorCode.IDENTIFIER_SUPERSEDED
+
+        # 老标识在所有入口得到稳定一致、可区分的拒绝
+        for op in (
+            lambda: o.get("ci-1"),
+            lambda: o.renew("ci-1", 10),
+            lambda: o.reclaim("ci-1"),
+            lambda: o.retry_failed("ci-1"),
+            lambda: o.provision(_req("ci-1")),
+        ):
+            with pytest.raises(OrchestratorError) as info:
+                op()
+            assert info.value.code == ErrorCode.IDENTIFIER_SUPERSEDED
+
+        # 短 TTL 到点（恰好 5 秒）：不调用 reap，下一次访问立即按已回收处理
+        clock.advance(5)
+        with pytest.raises(OrchestratorError) as info:
+            o.get("ci-2")
+        assert info.value.code == ErrorCode.ENV_RECLAIMED
+        assert new_env.status is EnvStatus.RECLAIMED
+        assert new_env.expires_at is None
+
+        # 容量与后端资源当场让出
+        assert o.store.used_slots() == 0
+        assert o.store.available_slots() == 3
+        assert backend.active_count() == 0
+
+        # 让出的容量立刻可以被后续申请吃满；计数一个不多一个不少
+        for br in ("a", "b", "c"):
+            e = o.provision(_req(f"n-{br}", branch=br, ttl=100))
+            assert e.status is EnvStatus.READY
+        assert o.store.used_slots() == 3
+        assert o.store.available_slots() == 0
+        assert backend.active_count() == 9
+        snap = o.quota_snapshot()
+        assert snap["status_ready"] == 3
+        assert snap["status_reclaimed"] == 1
+        _assert_invariants(o, backend)
+    finally:
+        backend.allocate = orig  # type: ignore[method-assign]
+
+
+def test_takeover_failed_env_then_retry_uses_new_request_ttl(orchestrator, backend, clock):
+    """接管失败态环境：新属主重试成功后，租约按本次申请的 TTL 起算。"""
+    backend.fail_once("proj-bug")
+    first = orchestrator.provision(_req("ci-1", branch="bug", ttl=1000))
+    assert first.status is EnvStatus.FAILED
+    assert orchestrator.store.used_slots() == 0
+
+    # 新标识接管同一条 failed 记录（单活，不并存），只要求 5 秒
+    taken = orchestrator.provision(_req("ci-2", branch="bug", ttl=5))
+    assert taken is first
+    assert taken.status is EnvStatus.FAILED
+    assert taken.request_key == "ci-2"
+    # 接管时本次申请的 TTL 已记录，等待重试成功后据此起算
+    assert taken.ttl_seconds == 5
+
+    # 新属主重试成功
+    ok = orchestrator.retry_failed("ci-2")
+    assert ok is first
+    assert ok.status is EnvStatus.READY
+    assert ok.request_key == "ci-2"
+    assert ok.ready_at == clock()
+    # 关键断言：按本次申请的 5 秒，而不是旧申请的 1000
+    assert ok.ttl_seconds == 5
+    assert ok.expires_at == clock() + 5
+    assert orchestrator.store.used_slots() == 1
+    assert backend.active_count() == 3
+
+    # 老标识无论查询还是重试，结论一致为“已被接管”
+    for op in (
+        lambda: orchestrator.get("ci-1"),
+        lambda: orchestrator.retry_failed("ci-1"),
+        lambda: orchestrator.renew("ci-1", 100),
+        lambda: orchestrator.reclaim("ci-1"),
+    ):
+        with pytest.raises(OrchestratorError) as info:
+            op()
+        assert info.value.code == ErrorCode.IDENTIFIER_SUPERSEDED
+
+    # 到点即时回收、容量即时释放（走 renew 入口验证清扫同样生效）
+    clock.advance(5)
+    with pytest.raises(OrchestratorError) as info:
+        orchestrator.renew("ci-2", 100)
+    assert info.value.code == ErrorCode.ENV_RECLAIMED
+    assert orchestrator.store.used_slots() == 0
+    assert backend.active_count() == 0
+    assert orchestrator.store.available_slots() == 3
+
+    # 已回收不能被重试救活
+    with pytest.raises(OrchestratorError) as info:
+        orchestrator.retry_failed("ci-2")
+    assert info.value.code == ErrorCode.ENV_RECLAIMED
+    _assert_invariants(orchestrator, backend)
+
+
+def test_short_ttl_ready_takeover_expires_immediately_with_real_clock(backend):
+    """真实时钟：接管 READY 时要求极短 TTL，到点后立刻不可访问并释放容量。"""
+    import time
+
+    from app.orchestrator import PreviewEnvOrchestrator
+
+    o = PreviewEnvOrchestrator(quota=1, default_ttl_seconds=3600, backend=backend)
+    o.provision(_req("ci-1", ttl=100))
+    taken = o.provision(_req("ci-2", ttl=0.05))  # 50ms 后即到期
+    assert taken.status is EnvStatus.READY
+    assert taken.ttl_seconds == 0.05
+
+    time.sleep(0.25)  # 不调用 reap，等真实时间走过到期点
+
+    with pytest.raises(OrchestratorError) as info:
+        o.get("ci-2")
+    assert info.value.code == ErrorCode.ENV_RECLAIMED
+    assert o.store.used_slots() == 0
+    assert backend.active_count() == 0
+
+    # 容量当场可被后续申请使用；状态计数对得上
+    fresh = o.provision(_req("ci-3", ttl=100))
+    assert fresh.status is EnvStatus.READY
+    snap = o.quota_snapshot()
+    assert snap["used"] == 1 and snap["available"] == 0
+    assert snap["status_ready"] == 1 and snap["status_reclaimed"] == 1
+
+
+def test_expired_after_provisioning_takeover_cannot_be_revived(backend, clock):
+    """接管创建中 -> 短 TTL 到期后，同分支新标识只能新建，不能救活旧环境。"""
+    import time
+
+    from app.orchestrator import PreviewEnvOrchestrator
+
+    o = PreviewEnvOrchestrator(quota=3, backend=backend, clock=clock)
+    orig, entered, release = _delayed_backend(backend)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f_old = pool.submit(o.provision, _req("ci-1", ttl=1000))
+            entered.wait(timeout=2)
+            f_new = pool.submit(o.provision, _req("ci-2", ttl=5))
+            deadline = time.time() + 2
+            while time.time() < deadline and o.store.get_by_key("ci-2") is None:
+                time.sleep(0.001)
+            release.set()
+            new_env = f_new.result(timeout=2)
+            assert f_old.exception().code == ErrorCode.IDENTIFIER_SUPERSEDED
+
+        assert new_env.env_id == "proj-main"
+        clock.advance(5)  # 接管申请的短 TTL 到期
+        with pytest.raises(OrchestratorError):
+            o.get("ci-2")
+
+        # 同分支再来标识：旧环境是尸体不可接管，新建递增标识，容量重新占一槽
+        fresh = o.provision(_req("ci-3", ttl=100))
+        assert fresh.env_id == "proj-main-2"
+        assert fresh.status is EnvStatus.READY
+        assert fresh.expires_at == clock() + 100
+        assert o.store.used_slots() == 1
+        assert backend.active_count() == 3
+        assert o.store.get_by_id("proj-main").status is EnvStatus.RECLAIMED
+        _assert_invariants(o, backend)
+    finally:
+        backend.allocate = orig  # type: ignore[method-assign]

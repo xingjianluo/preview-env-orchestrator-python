@@ -123,15 +123,31 @@ CI 每次重跑都会带来一个新的申请标识（`request_key`），但分�
    新键，老键写入 `_superseded`），复用同一 env_id 与同一批资源，不新增槽位；
 5. 分支无存活环境 → 才真正新建、占槽、分配资源。
 
-接管时的存活时间：
+接管时的存活时间（**一律以本次接管申请携带的 `ttl_seconds` 为准**，
+从“该环境新的就绪时刻”起算，绝不沿用旧申请可能更长的 TTL）：
 
-- 被接管环境已是 `ready`：**租约从接管时刻重新起算**，
-  `ready_at = now`、`expires_at = now + 本次申请的 ttl`（不是在旧到期时间上
-  叠加，也不保留旧 TTL 余量）；
-- 被接管环境仍在 `provisioning`：接管方等待创建 settle，环境就绪时按本次申请
-  的 TTL 起算；
-- 被接管环境是 `failed`：接管同一条 failed 记录（仍受单活约束），由新属主
-  调 `retry` 重试，成功后才持有资源与租约。
+- 被接管环境已是 `ready`：接管在锁内立即把租约**从接管时刻重新起算**，
+  `ready_at = now`、`expires_at = now + 本次申请的 ttl`——不是在旧到期时间上
+  叠加，也不保留旧 TTL 余量；
+- 被接管环境仍在 `provisioning`：接管发生时先把本次申请的 TTL 记录到环境上，
+  接管方等待创建 settle；创建提交就绪时按
+  `expires_at = 本次 ready_at + 本次申请的 ttl` 起算（使用的是接管方的 TTL，
+  而不是创建者最初申请的 TTL）。创建若以失败告终，环境归接管方所有、保持
+  `failed`，由接管方自行 retry；
+- 被接管环境是 `failed`：接管同一条 failed 记录（仍受单活约束），接管时同样
+  先记录本次申请的 TTL；新属主调 `retry` 重试，**成功就绪的那一刻**才持有
+  资源与租约，`expires_at = retry 就绪时刻 + 本次申请的 ttl`。
+
+> 即三种状态的结论完全一致：**接管成功后新标识是唯一属主，租约只认本次
+> 申请的时长、且从属于新标识的就绪时刻开始算。** 修复前 provisioning/failed
+> 接管路径没有写入本次 TTL，导致短 TTL 申请最终仍按旧申请的长 TTL 存活；
+> 现在三种路径在接管换绑的同一临界区内统一写入本次 TTL 来消除该分叉。
+
+**接管要求极短 TTL（甚至到点即到期）时**：就绪提交后下一次进入任意临界区
+（get/renew/reclaim/provision/retry/quota_snapshot）时，过期清扫立即把环境
+收敛为 `reclaimed`，后端资源与配额槽位在同一临界区内当场释放、退出分支单活
+索引，容量立刻可以被后续申请或接管使用；已过期/已回收的环境不能被接管救活，
+同分支新标识只会拿到递增的新 env_id 新建一份。
 
 ### 5.3 老标识的结果：清楚且一致
 
@@ -274,6 +290,17 @@ uv run pytest -q
 for i in $(seq 1 30); do \
   uv run pytest tests/test_concurrency.py tests/test_takeover.py -q || break; \
 done
+
+# 本次修复的定向用例：
+#   1) 接管创建中环境，本次申请的短 TTL 在就绪时生效、到点即时回收、容量即时释放；
+#   2) 接管失败态环境后重试成功，租约按本次申请的 TTL 从新的就绪时刻起算；
+#   3) 真实时钟下接管 READY 要求极短 TTL，到期后立刻不可访问、容量可被后续申请使用；
+#   4) 接管创建中 -> 短 TTL 到期后，同分支新标识只能新建，旧环境不可救活。
+uv run pytest tests/test_takeover.py -q \
+  -k "provisioning_short_ttl or failed_env_then_retry or short_ttl_ready or expired_after_provisioning"
+# 老用例不回归：申请复用 / 失败重试 / 配额拒绝 / 并发抢配额 / 完整生命周期
+uv run pytest tests/test_lifecycle.py tests/test_quota.py tests/test_concurrency.py \
+  tests/test_store.py tests/test_api.py -q
 
 # 启动服务
 uv run uvicorn main:app --port 8000
