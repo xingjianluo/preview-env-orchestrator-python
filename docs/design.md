@@ -123,15 +123,25 @@ CI 每次重跑都会带来一个新的申请标识（`request_key`），但分�
    新键，老键写入 `_superseded`），复用同一 env_id 与同一批资源，不新增槽位；
 5. 分支无存活环境 → 才真正新建、占槽、分配资源。
 
-接管时的存活时间：
+接管时的存活时间（核心规则：**以接管这次申请的 `ttl_seconds` 为准，从新的就绪
+时刻起算**，旧申请的时长一律作废）。接管发生的同一临界区内，环境的
+`ttl_seconds` 即被换成本次申请的值，之后无论环境走到哪条就绪路径，都用新时长：
 
 - 被接管环境已是 `ready`：**租约从接管时刻重新起算**，
   `ready_at = now`、`expires_at = now + 本次申请的 ttl`（不是在旧到期时间上
   叠加，也不保留旧 TTL 余量）；
-- 被接管环境仍在 `provisioning`：接管方等待创建 settle，环境就绪时按本次申请
-  的 TTL 起算；
+- 被接管环境仍在 `provisioning`：接管方等待创建 settle；创建提交就绪时
+  `expires_at = ready_at + 本次申请的 ttl`——即从**实际就绪那一刻**按新时长
+  起算，旧申请（创建者）的长 TTL 不会生效；
 - 被接管环境是 `failed`：接管同一条 failed 记录（仍受单活约束），由新属主
-  调 `retry` 重试，成功后才持有资源与租约。
+  调 `retry`；重试成功提交就绪时同样 `expires_at = ready_at + 本次申请的 ttl`，
+  从**重试就绪那一刻**按新时长起算。
+
+因此三种状态下结论一致：新标识是唯一属主，存活时间只认接管这次申请的时长；
+老标识在查询/续期/回收/重试/再申请上都只得到 `IDENTIFIER_SUPERSEDED`。
+若接管的这次申请只要求很短的 TTL（甚至接近立即到期），到点后由 §4 的惰性
+清扫**当场**按 `reclaimed` 处理：查询立即得到 410、后端资源与配额槽位在同一
+临界区内释放，容量立刻可供后续申请/接管使用；已过期环境不会被接管“救活”。
 
 ### 5.3 老标识的结果：清楚且一致
 
@@ -290,6 +300,10 @@ curl -s -X DELETE localhost:8000/environments/ci-2
 
 # 到期实时生效：把时钟/TTL 调到过期后，直接 GET（不调用 /reap）即返回 410，
 # 且 GET /quota 可见 used/资源已立即释放（该路径由 tests/test_takeover.py 覆盖）
+
+# 只跑“接管时新 TTL 生效”相关用例：
+# 接管创建中环境、接管失败态后重试、极短 TTL 即时到期与容量即时释放
+uv run pytest tests/test_takeover.py -q -k "new_ttl or tiny_ttl or single_owner_consistent"
 ```
 
 故障注入由测试通过 `ResourceBackend.fail_once(env_id)` /

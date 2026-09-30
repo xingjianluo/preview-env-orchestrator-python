@@ -532,3 +532,167 @@ def test_takeover_does_not_consume_quota_when_full(orchestrator, backend):
     assert orchestrator.store.used_slots() == 3
     assert backend.active_count() == 9
     _assert_invariants(orchestrator, backend)
+
+
+# ------------------------------------------- 接管时新申请的 TTL 必须生效
+
+def test_takeover_provisioning_env_applies_new_ttl_from_ready_moment(backend, clock):
+    """接管创建中的环境：就绪时按本次申请的短 TTL 起算，而不是旧申请的长 TTL。"""
+    import time
+
+    from app.orchestrator import PreviewEnvOrchestrator
+
+    o = PreviewEnvOrchestrator(quota=2, backend=backend, clock=clock)
+    orig = backend.allocate
+    entered = threading.Event()
+    release = threading.Event()
+
+    def delayed(env_id):
+        entered.set()
+        release.wait(timeout=2)
+        return orig(env_id)
+
+    backend.allocate = delayed  # type: ignore[method-assign]
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            # 老申请要求超长存活；新申请只要求 5 秒
+            f_old = pool.submit(o.provision, _req("ci-1", ttl=10000))
+            entered.wait(timeout=2)  # 老创建已进入后端分配（环境 provisioning）
+            f_new = pool.submit(o.provision, _req("ci-2", ttl=5))
+
+            deadline = time.time() + 2
+            while time.time() < deadline and o.store.get_by_key("ci-2") is None:
+                time.sleep(0.001)
+            clock.advance(3)  # 创建耗时 3 秒
+            release.set()
+
+            env = f_new.result(timeout=2)
+            old_exc = f_old.exception(timeout=2)
+
+        # 就绪时刻起算、且用的是接管这次申请的 5 秒，而非旧申请的 10000 秒
+        assert env.status is EnvStatus.READY
+        assert env.request_key == "ci-2"
+        assert env.ttl_seconds == 5
+        assert env.ready_at == clock()
+        assert env.expires_at == env.ready_at + 5
+        assert env.expires_at != env.ready_at + 10000
+        assert isinstance(old_exc, OrchestratorError)
+        assert old_exc.code == ErrorCode.IDENTIFIER_SUPERSEDED
+        _assert_invariants(o, backend, quota=2)
+
+        # 短 TTL 到点：立即按已回收处理，容量当场让出
+        clock.advance(5)
+        with pytest.raises(OrchestratorError) as info:
+            o.get("ci-2")
+        assert info.value.code == ErrorCode.ENV_RECLAIMED
+        assert o.store.used_slots() == 0
+        assert backend.active_count() == 0
+        _assert_invariants(o, backend, quota=2)
+
+        # 让出的容量立刻可供后续申请使用
+        fresh = o.provision(_req("ci-3", branch="other"))
+        assert fresh.status is EnvStatus.READY
+        assert o.store.used_slots() == 1
+        _assert_invariants(o, backend, quota=2)
+    finally:
+        backend.allocate = orig  # type: ignore[method-assign]
+
+
+def test_takeover_failed_env_then_retry_applies_new_ttl(orchestrator, backend, clock):
+    """接管失败态环境再重试成功：租约从重试就绪时刻按新申请的 TTL 起算。"""
+    backend.fail_once("proj-bug")
+    first = orchestrator.provision(_req("ci-1", branch="bug", ttl=10000))
+    assert first.status is EnvStatus.FAILED
+    assert first.ttl_seconds == 10000
+
+    clock.advance(2)
+    # 新标识以短 TTL 接管这份 failed 记录
+    taken = orchestrator.provision(_req("ci-2", branch="bug", ttl=7))
+    assert taken is first
+    assert taken.status is EnvStatus.FAILED
+    assert taken.ttl_seconds == 7  # 接管当即换成本次申请的时长
+
+    clock.advance(3)
+    ok = orchestrator.retry_failed("ci-2")
+    assert ok.status is EnvStatus.READY
+    # 从（重试）就绪时刻起算 7 秒，而不是旧申请的 10000 秒
+    assert ok.ready_at == clock()
+    assert ok.expires_at == clock() + 7
+    assert ok.ttl_seconds == 7
+    _assert_invariants(orchestrator, backend)
+
+    # 老标识在查询/续期/回收/重试/再申请上得到稳定一致、可区分的拒绝
+    for op in (
+        lambda: orchestrator.get("ci-1"),
+        lambda: orchestrator.renew("ci-1", 10),
+        lambda: orchestrator.reclaim("ci-1"),
+        lambda: orchestrator.retry_failed("ci-1"),
+        lambda: orchestrator.provision(_req("ci-1", branch="bug")),
+    ):
+        with pytest.raises(OrchestratorError) as info:
+            op()
+        assert _superseded(info)
+
+    # 7 秒到点：立即回收、容量与资源当场释放
+    clock.advance(7)
+    with pytest.raises(OrchestratorError) as info:
+        orchestrator.get("ci-2")
+    assert info.value.code == ErrorCode.ENV_RECLAIMED
+    assert orchestrator.store.used_slots() == 0
+    assert backend.active_count() == 0
+    _assert_invariants(orchestrator, backend)
+
+
+def test_takeover_ready_env_with_tiny_ttl_expires_immediately(orchestrator, backend, clock):
+    """接管已就绪环境且本次 TTL 极短：到点立即失效，容量立刻让给后面的申请。"""
+    orchestrator.provision(_req("ci-1", ttl=100))
+    clock.advance(50)
+
+    taken = orchestrator.provision(_req("ci-2", ttl=1))
+    assert taken.expires_at == clock() + 1
+    assert orchestrator.store.used_slots() == 1
+
+    clock.advance(1)  # 恰好到点，不调用 reap
+    with pytest.raises(OrchestratorError) as info:
+        orchestrator.get("ci-2")
+    assert info.value.code == ErrorCode.ENV_RECLAIMED
+    assert taken.status is EnvStatus.RECLAIMED
+    assert orchestrator.store.used_slots() == 0
+    assert backend.active_count() == 0
+
+    # 容量当场可用：同分支新标识新建（递增 env_id），不是复活尸体
+    fresh = orchestrator.provision(_req("ci-3", ttl=100))
+    assert fresh.env_id == "proj-main-2"
+    assert fresh.status is EnvStatus.READY
+    assert orchestrator.store.used_slots() == 1
+    assert backend.active_count() == 3
+    _assert_invariants(orchestrator, backend)
+
+
+def test_takeover_failed_env_keeps_single_owner_consistent_results(orchestrator, backend):
+    """接管 failed 环境后：新标识是唯一属主，老标识任何操作都被稳定拒绝。"""
+    backend.fail_once("proj-bug")
+    orchestrator.provision(_req("ci-1", branch="bug"))
+    orchestrator.provision(_req("ci-2", branch="bug"))  # 接管 failed
+
+    # 属主唯一
+    assert orchestrator.store.get_by_key("ci-2") is not None
+    assert orchestrator.store.get_by_key("ci-1") is None
+
+    # 老标识反复重试/查询/回收：结论稳定一致且可区分
+    for _ in range(3):
+        with pytest.raises(OrchestratorError) as info:
+            orchestrator.retry_failed("ci-1")
+        assert _superseded(info)
+    # 新属主重试成功后，老标识结论不变（仍是被接管，而不是“环境已就绪”）
+    ok = orchestrator.retry_failed("ci-2")
+    assert ok.status is EnvStatus.READY
+    for op in (
+        lambda: orchestrator.get("ci-1"),
+        lambda: orchestrator.retry_failed("ci-1"),
+        lambda: orchestrator.reclaim("ci-1"),
+    ):
+        with pytest.raises(OrchestratorError) as info:
+            op()
+        assert _superseded(info)
+    _assert_invariants(orchestrator, backend)

@@ -226,13 +226,19 @@ class PreviewEnvOrchestrator:
                     live.history.append(
                         f"{self.now():.3f} ownership taken over by key={request_key}"
                     )
+                    # 无论被接管环境处于哪种状态，本次申请的 TTL 都取代旧时长：
+                    # provisioning/failed 在（重试）就绪提交时按 ready_at + 新 TTL 起算，
+                    # ready 则立即从接管时刻重起租约。三种状态结论一致。
+                    live.ttl_seconds = ttl
+                    live.history.append(
+                        f"{self.now():.3f} ttl superseded by takeover ttl={ttl:g}"
+                    )
                     if live.status == EnvStatus.PROVISIONING:
                         # 接管发生在别人的创建过程中：等就绪/失败结论，再以属主身份复用
                         self.store.wait_until_settled(live)
                         continue
                     if live.status == EnvStatus.READY:
                         # 租约从接管时刻重新起算（使用本次申请的 TTL）
-                        live.ttl_seconds = ttl
                         live.ready_at = self.now()
                         live.expires_at = live.ready_at + ttl
                         live.history.append(
